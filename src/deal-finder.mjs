@@ -66,13 +66,13 @@ function isInStock(offer) {
 }
 function embeddedJsonDocuments(html) {
   const docs = [];
-  const re = /<script\\b([^>]*)>([\\s\\S]*?)<\\/script>/gi;
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
   for (const match of html.matchAll(re)) {
     const attrs = match[1] || "";
     const body = match[2]?.trim();
     if (!body || !/(?:id=["']__NEXT_DATA__["']|__NEXT_DATA__|__APOLLO_STATE__)/i.test(attrs + body.slice(0, 300))) continue;
     const candidates = [body];
-    const assignment = body.match(/(?:window\\.)?__(?:NEXT_DATA|APOLLO_STATE)__\\s*=\\s*({[\\s\\S]*})\\s*;?$/);
+    const assignment = body.match(/(?:window\.)?__(?:NEXT_DATA|APOLLO_STATE)__\s*=\s*({[\s\S]*})\s*;?$/);
     if (assignment?.[1]) candidates.push(assignment[1]);
     for (const candidate of candidates) {
       try { docs.push(JSON.parse(candidate)); break; } catch {}
