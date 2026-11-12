@@ -125,30 +125,19 @@ async function getProductDetails(ids) {
 }
 
 function summarizeVariantData(product) {
-  const variants = Array.isArray(product?.variants) ? product.variants : [];
-  const summarizeOption = option => {
-    if (Array.isArray(option)) return option.map(x => ({
-      name: x?.name ?? x?.label ?? x?.key ?? null,
-      value: x?.value ?? x?.displayValue ?? x?.label ?? null
-    }));
-    if (option && typeof option === "object") return Object.fromEntries(
-      Object.entries(option).map(([k, v]) => [k,
-        v && typeof v === "object" ? (v.value ?? v.name ?? v.label ?? "[object]") : v
-      ])
-    );
-    return option ?? null;
+  const variants = product?.variants;
+  const shallowShape = (value, depth = 0) => {
+    if (value == null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.slice(0, 5).map(x => shallowShape(x, depth + 1));
+    if (depth >= 3) return "[nested object]";
+    return Object.fromEntries(Object.entries(value).slice(0, 20).map(([key, child]) => [
+      key, child && typeof child === "object" ? shallowShape(child, depth + 1) : child
+    ]));
   };
   return {
-    variantsField: Array.isArray(product?.variants) ? "array" : String(product?.variants ?? "missing"),
-    variantCount: variants.length,
-    variants: variants.slice(0, 20).map(v => ({
-      id: v?.id ?? null,
-      options: summarizeOption(v?.options ?? v?.optionValues ?? v?.attributes),
-      size: v?.size ?? v?.sizeName ?? v?.sizeValue ?? null,
-      name: v?.name ?? v?.title ?? v?.label ?? null,
-      price: v?.price ?? v?.currentPrice ?? null,
-      availability: v?.availability ?? v?.availabilityStatus ?? null
-    })),
+    variantsType: Array.isArray(variants) ? "array" : typeof variants,
+    variantKeys: variants && typeof variants === "object" ? Object.keys(variants).slice(0, 30) : [],
+    variantsShape: shallowShape(variants),
     productPrice: product?.price ?? null,
     productAvailability: product?.availability ?? null,
     priceRange: product?.priceRange ?? null,
