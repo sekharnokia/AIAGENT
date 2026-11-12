@@ -117,9 +117,44 @@ async function searchProducts() {
   return Array.isArray(body?.items) ? body.items : [];
 }
 
-async function getProductDetails(id) {
-  const body = await walmartApi("products/details", { id });
-  return body?.product ?? body;
+async function getProductDetails(ids) {
+  // SteadyAPI batch endpoint returns full details for up to five items in one
+  // weighted request, preserving the order of the submitted IDs.
+  const body = await walmartApi("products/batch", { ids: ids.join(",") });
+  return Array.isArray(body) ? body : [];
+}
+
+function summarizeVariantData(product) {
+  const variants = Array.isArray(product?.variants) ? product.variants : [];
+  const summarizeOption = option => {
+    if (Array.isArray(option)) return option.map(x => ({
+      name: x?.name ?? x?.label ?? x?.key ?? null,
+      value: x?.value ?? x?.displayValue ?? x?.label ?? null
+    }));
+    if (option && typeof option === "object") return Object.fromEntries(
+      Object.entries(option).map(([k, v]) => [k,
+        v && typeof v === "object" ? (v.value ?? v.name ?? v.label ?? "[object]") : v
+      ])
+    );
+    return option ?? null;
+  };
+  return {
+    variantsField: Array.isArray(product?.variants) ? "array" : String(product?.variants ?? "missing"),
+    variantCount: variants.length,
+    variants: variants.slice(0, 20).map(v => ({
+      id: v?.id ?? null,
+      options: summarizeOption(v?.options ?? v?.optionValues ?? v?.attributes),
+      size: v?.size ?? v?.sizeName ?? v?.sizeValue ?? null,
+      name: v?.name ?? v?.title ?? v?.label ?? null,
+      price: v?.price ?? v?.currentPrice ?? null,
+      availability: v?.availability ?? v?.availabilityStatus ?? null
+    })),
+    productPrice: product?.price ?? null,
+    productAvailability: product?.availability ?? null,
+    priceRange: product?.priceRange ?? null,
+    sizeSpecifications: (Array.isArray(product?.specifications) ? product.specifications : [])
+      .filter(x => /size/i.test(String(x?.name ?? ""))).slice(0, 10)
+  };
 }
 
 async function sendTelegram(items) {
@@ -184,20 +219,32 @@ async function main() {
 
   console.log(`Fetching detailed variant data for ${byId.size} product(s).`);
   const verified = [];
+  const ids = [...byId.keys()];
+  let detailRows = [];
+  try {
+    detailRows = await getProductDetails(ids);
+    console.log(`SteadyAPI batch detail response contained ${detailRows.length} product record(s).`);
+  } catch (error) {
+    console.log(`Batch details request failed: ${error.message}`);
+  }
+
+  const detailById = new Map(detailRows.map(product => [String(product?.id ?? ""), product]));
   for (const [id, listing] of byId) {
-    try {
-      const product = await getProductDetails(id);
-      const merged = { ...listing, ...product, id: String(product?.id || id) };
-      const deal = verifiedDeal(merged);
-      if (deal) {
-        const previous = state.seen[deal.url];
-        if (!previous || Number(previous.price) > deal.price) verified.push(deal);
-        console.log(`Verified ${deal.title}: $${deal.price.toFixed(2)} in size ${TARGET_SIZE}.`);
-      } else {
-        console.log(`Not eligible: ${listing.title || id} (no verified in-stock ${TARGET_SIZE} variant below $${MAX_PRICE}).`);
-      }
-    } catch (error) {
-      console.log(`Could not verify product ${id}: ${error.message}`);
+    const product = detailById.get(id);
+    if (!product || product.error) {
+      console.log(`Could not verify product ${id}: ${product?.error || "missing from batch response"}`);
+      continue;
+    }
+    const merged = { ...listing, ...product, id: String(product?.id || id) };
+    const deal = verifiedDeal(merged);
+    if (deal) {
+      const previous = state.seen[deal.url];
+      if (!previous || Number(previous.price) > deal.price) verified.push(deal);
+      console.log(`Verified ${deal.title}: ${deal.price.toFixed(2)} in size ${TARGET_SIZE}.`);
+    } else {
+      // Diagnostic only: never logs credentials or the full product payload.
+      console.log(`Variant diagnostics for ${listing.title || id}: ${JSON.stringify(summarizeVariantData(merged))}`);
+      console.log(`Not eligible: no verified in-stock ${TARGET_SIZE} variant below ${MAX_PRICE}.`);
     }
   }
 
