@@ -1,12 +1,10 @@
 import fs from "node:fs/promises";
 
-const STORES = [
-  { name: "Walmart", domain: "walmart.com" },
-];
+const API_BASE = "https://api.steadyapi.com/v1/walmart";
 const TARGET_SIZE = "3T";
 const MAX_PRICE = 10;
 const STATE_PATH = "data/seen.json";
-const MAX_ALERTS_PER_RUN = 12;
+const MAX_DETAILS_PER_RUN = 4; // 1 seeded item + at most 3 search results
 const TIME_ZONE = "America/New_York";
 
 function localHourAndDate() {
@@ -17,270 +15,141 @@ function localHourAndDate() {
   return Object.fromEntries(parts.map(p => [p.type, p.value]));
 }
 
-function decodeHtml(s = "") {
-  return s.replaceAll("&amp;", "&").replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'").replaceAll("&lt;", "<").replaceAll("&gt;", ">");
-}
-function asArray(x) { return Array.isArray(x) ? x : x ? [x] : []; }
-function walkProducts(node, out = []) {
-  if (!node || typeof node !== "object") return out;
-  if (Array.isArray(node)) { for (const v of node) walkProducts(v, out); return out; }
-  const types = asArray(node["@type"]);
-  if (types.some(t => String(t).toLowerCase() === "product")) out.push(node);
-  for (const value of Object.values(node)) {
-    if (value && typeof value === "object") walkProducts(value, out);
-  }
-  return out;
-}
-function parseJsonLd(html) {
-  const docs = [];
-  const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  for (const match of html.matchAll(re)) {
-    try { docs.push(JSON.parse(match[1].trim())); } catch {}
-  }
-  return docs.flatMap(d => walkProducts(d));
-}
-function offerList(value) {
-  if (!value) return [];
-  if (Array.isArray(value)) return value.flatMap(offerList);
-  if (value["@type"] === "AggregateOffer") return offerList(value.offers);
-  return [value];
-}
-function sizeText(v) {
-  return [v?.size, v?.name, v?.sku, v?.description]
-    .filter(Boolean).join(" ").toUpperCase();
-}
-function isTargetSize(v) {
-  return /(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(sizeText(v));
-}
-function priceOf(offer) {
-  const raw = offer?.price ?? offer?.lowPrice ?? offer?.priceSpecification?.price;
-  const n = Number(String(raw ?? "").replace(/[^0-9.]/g, ""));
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-function isInStock(offer) {
-  return /InStock|LimitedAvailability/i.test(String(offer?.availability ?? ""));
-}
-function embeddedJsonDocuments(html) {
-  const docs = [];
-  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-  for (const match of html.matchAll(re)) {
-    const attrs = match[1] || "";
-    const body = match[2]?.trim();
-    if (!body || !/(?:id=["']__NEXT_DATA__["']|__NEXT_DATA__|__APOLLO_STATE__)/i.test(attrs + body.slice(0, 300))) continue;
-    const candidates = [body];
-    const assignment = body.match(/(?:window\.)?__(?:NEXT_DATA|APOLLO_STATE)__\s*=\s*({[\s\S]*})\s*;?$/);
-    if (assignment?.[1]) candidates.push(assignment[1]);
-    for (const candidate of candidates) {
-      try { docs.push(JSON.parse(candidate)); break; } catch {}
-    }
-  }
-  return docs;
-}
-function deepEntries(node, wanted, depth = 0, out = []) {
-  if (!node || typeof node !== "object" || depth > 12) return out;
-  if (Array.isArray(node)) {
-    for (const item of node) deepEntries(item, wanted, depth + 1, out);
-    return out;
-  }
-  for (const [key, value] of Object.entries(node)) {
-    if (wanted.has(key.toLowerCase()) && value !== null && value !== undefined) out.push(value);
-    if (value && typeof value === "object") deepEntries(value, wanted, depth + 1, out);
-  }
-  return out;
-}
-function embeddedSize(node) {
-  const values = deepEntries(node, new Set(["size", "sizename", "sizevalue", "variantsize", "displaysize", "variantname", "optionvalue"]));
-  for (const value of values) {
-    const text = typeof value === "string" ? value : value?.name ?? value?.value ?? value?.label ?? "";
-    if (/(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(String(text))) return String(text);
-  }
-  return null;
-}
-function embeddedPrice(node) {
-  const values = deepEntries(node, new Set(["price", "saleprice", "currentprice", "currentpricevalue"]));
-  for (const value of values) {
-    const raw = typeof value === "object" ? value?.price ?? value?.value ?? value?.amount : value;
-    const n = Number(String(raw ?? "").replace(/[^0-9.]/g, ""));
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-  return null;
-}
-function embeddedAvailability(node) {
-  const values = deepEntries(node, new Set(["availability", "availabilitystatus", "stockstatus", "isavailable", "instock"]));
-  return values.length ? values[0] : null;
-}
-function embeddedInStock(value) {
-  if (value === true) return true;
-  if (value === false || value == null) return false;
-  if (typeof value === "object") {
-    const nested = value.status ?? value.value ?? value.name ?? value.availabilityStatus;
-    return embeddedInStock(nested);
-  }
-  return /(?:InStock|LimitedAvailability|IN_STOCK|AVAILABLE|IN STOCK)/i.test(String(value))
-    && !/(?:OUT_OF_STOCK|NOT_AVAILABLE|UNAVAILABLE|SOLD_OUT)/i.test(String(value));
-}
-function walkEmbeddedVariants(node, ancestors = [], out = []) {
-  if (!node || typeof node !== "object") return out;
-  if (Array.isArray(node)) {
-    for (const item of node) walkEmbeddedVariants(item, ancestors, out);
-    return out;
-  }
-  const size = embeddedSize(node);
-  if (size) {
-    const contexts = [node, ...ancestors];
-    let price = null;
-    let stock = null;
-    for (const context of contexts) {
-      price ??= embeddedPrice(context);
-      if (stock === null) stock = embeddedAvailability(context);
-    }
-    if (price !== null && embeddedInStock(stock)) {
-      const titleValues = deepEntries(node, new Set(["productname", "itemname", "title", "name"]));
-      const title = titleValues.find(v => typeof v === "string" && v.length > 5);
-      out.push({ size, price, title: title || null });
-    }
-  }
-  const nextAncestors = [node, ...ancestors].slice(0, 8);
-  for (const value of Object.values(node)) {
-    if (value && typeof value === "object") walkEmbeddedVariants(value, nextAncestors, out);
-  }
-  return out;
-}
-function verifyWalmartEmbedded(html, fallbackTitle, url) {
-  for (const doc of embeddedJsonDocuments(html)) {
-    const variants = walkEmbeddedVariants(doc);
-    for (const variant of variants) {
-      if (variant.price >= MAX_PRICE) continue;
-      const retailer = STORES.find(s => new URL(url).hostname.toLowerCase().endsWith(s.domain));
-      if (!retailer) continue;
-      return {
-        title: decodeHtml(variant.title || fallbackTitle || "Kids clothing item").slice(0, 150),
-        price: variant.price,
-        size: variant.size,
-        retailer: retailer.name,
-        url
-      };
-    }
-  }
-  return null;
-}
-function verifyPage(html, fallbackTitle, url) {
-  const products = parseJsonLd(html);
-  for (const p of products) {
-    const variants = [...asArray(p.hasVariant), ...asArray(p.model), p];
-    for (const v of variants) {
-      const offers = offerList(v.offers ?? v.offers?.offers);
-      for (const offer of offers) {
-        const sizeVerified = isTargetSize(v) || isTargetSize(offer);
-        const price = priceOf(offer);
-        if (!sizeVerified || price === null || price >= MAX_PRICE || !isInStock(offer)) continue;
-        const title = decodeHtml(v.name || p.name || fallbackTitle || "Kids clothing item").slice(0, 150);
-        const retailer = STORES.find(s => new URL(url).hostname.toLowerCase().endsWith(s.domain));
-        if (!retailer) continue;
-        return { title, price, size: sizeText(v) || sizeText(offer), retailer: retailer.name, url };
-      }
-    }
-  }
-  if (new URL(url).hostname.toLowerCase().endsWith("walmart.com")) {
-    return verifyWalmartEmbedded(html, fallbackTitle, url);
-  }
-  return null;
-}
-function stableUrl(raw) {
+function stableUrl(raw, id) {
   try {
-    const u = new URL(raw);
-    if (!["http:", "https:"].includes(u.protocol)) return null;
-    for (const key of [...u.searchParams.keys()]) {
-      if (/^(utm_|gclid|fbclid|source|ref)/i.test(key)) u.searchParams.delete(key);
-    }
+    const u = new URL(raw || `https://www.walmart.com/ip/${id}`);
+    if (u.hostname !== "walmart.com" && !u.hostname.endsWith(".walmart.com")) return null;
     u.hash = "";
     return u.toString();
   } catch { return null; }
 }
+
 function escapeHtml(s) {
   return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
-async function tavilySearch(domain) {
-  const query = `Walmart kids toddler clothing size 3T price under $10 clearance sale in stock available add to cart shirts tops pants shorts dresses pajamas` ;
-  const response = await fetch("https://api.tavily.com/search", {
+
+async function walmartApi(path, params = {}) {
+  const url = new URL(`${API_BASE}/${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${process.env.WALMART_API_KEY}`,
+      Accept: "application/json"
+    },
+    signal: AbortSignal.timeout(30000)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.message || data.error || response.statusText;
+    throw new Error(`SteadyAPI ${path} failed (${response.status}): ${detail}`);
+  }
+  if (data.meta?.status && Number(data.meta.status) >= 400) {
+    throw new Error(`SteadyAPI ${path}: ${data.message || data.meta.status}`);
+  }
+  return data.body;
+}
+
+function optionEntries(options) {
+  if (Array.isArray(options)) {
+    return options.map(option => [
+      String(option?.name ?? option?.label ?? option?.key ?? ""),
+      String(option?.value ?? option?.displayValue ?? option?.label ?? "")
+    ]);
+  }
+  if (options && typeof options === "object") {
+    return Object.entries(options).map(([key, value]) => [
+      key, String(value?.value ?? value?.name ?? value)
+    ]);
+  }
+  return [];
+}
+
+function getSizeFromVariant(variant) {
+  const entries = optionEntries(variant?.options ?? variant?.optionValues ?? variant?.attributes);
+  for (const [key, value] of entries) {
+    if (/size/i.test(key) && /(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(value)) return value;
+  }
+  const fallback = [
+    variant?.size, variant?.sizeName, variant?.sizeValue,
+    variant?.name, variant?.title, variant?.label
+  ].filter(Boolean).join(" ");
+  return /(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(fallback) ? fallback : null;
+}
+
+function inStock(value) {
+  if (value === true) return true;
+  if (value === false || value == null) return false;
+  return /IN_STOCK|AVAILABLE|LIMITED_AVAILABILITY|INSTOCK/i.test(String(value))
+    && !/OUT_OF_STOCK|UNAVAILABLE|SOLD_OUT/i.test(String(value));
+}
+
+function verifiedDeal(product) {
+  const variants = Array.isArray(product.variants) ? product.variants : [];
+  for (const variant of variants) {
+    const size = getSizeFromVariant(variant);
+    const price = Number(variant.price ?? variant.currentPrice ?? product.price);
+    const availability = variant.availability ?? variant.availabilityStatus;
+    if (!size || !Number.isFinite(price) || price <= 0 || price >= MAX_PRICE || !inStock(availability)) continue;
+    const url = stableUrl(product.url, product.id);
+    if (!url) continue;
+    return {
+      title: product.title || "Walmart kids clothing",
+      retailer: "Walmart",
+      price,
+      size: TARGET_SIZE,
+      url,
+      id: String(product.id)
+    };
+  }
+  return null;
+}
+
+async function searchProducts() {
+  const body = await walmartApi("search", {
+    q: "toddler kids clothing 3T",
+    maxPrice: MAX_PRICE,
+    sort: "price_low",
+    page: 1
+  });
+  return Array.isArray(body?.items) ? body.items : [];
+}
+
+async function getProductDetails(id) {
+  const body = await walmartApi("products/details", { id });
+  return body?.product ?? body;
+}
+
+async function sendTelegram(items) {
+  const messages = items.map(item => [
+    `<b>${escapeHtml(item.title)}</b>`,
+    "Store: Walmart",
+    `Price: <b>$${item.price.toFixed(2)}</b>`,
+    `Size: ${TARGET_SIZE} (in stock)`,
+    `<a href="${escapeHtml(item.url)}">Shop product</a>`
+  ].join("\n"));
+  const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      api_key: process.env.TAVILY_API_KEY,
-      query,
-      search_depth: "basic",
-      max_results: 15,
-      include_domains: [domain],
-      topic: "general"
+      chat_id: process.env.TELEGRAM_CHAT_ID,
+      text: messages.join("\n\n"),
+      parse_mode: "HTML",
+      disable_web_page_preview: false
     }),
-    signal: AbortSignal.timeout(25000)
+    signal: AbortSignal.timeout(20000)
   });
-  if (!response.ok) throw new Error(`Tavily search failed (${response.status})`);
   const data = await response.json();
-  return data.results ?? [];
-}
-async function verifyResult(result, store) {
-  const url = stableUrl(result.url);
-  if (!url) return null;
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; KidsDealFinder/1.0; +https://github.com/sekharnokia/AIAGENT)",
-        "accept": "text/html,application/xhtml+xml"
-      },
-      redirect: "follow",
-      signal: AbortSignal.timeout(18000)
-    });
-    if (!response.ok) return null;
-    const finalUrl = stableUrl(response.url);
-    if (!finalUrl || !new URL(finalUrl).hostname.toLowerCase().endsWith(store.domain)) return null;
-    const html = (await response.text()).slice(0, 3_000_000);
-    return verifyPage(html, result.title, finalUrl);
-  } catch (err) {
-    console.log(`Skipping page that could not be verified: ${url} (${err.message})`);
-    return null;
-  }
-}
-async function sendTelegram(items) {
-  const chunks = [];
-  let current = "";
-  for (const item of items) {
-    const message = [
-      `<b>${escapeHtml(item.title)}</b>`,
-      `Store: ${escapeHtml(item.retailer)}`,
-      `Price: <b>$${item.price.toFixed(2)}</b>`,
-      `Size: ${escapeHtml(item.size)}`,
-      `<a href="${escapeHtml(item.url)}">Shop product</a>`
-    ].join("\n");
-    if (current && current.length + message.length + 3 > 3800) {
-      chunks.push(current); current = "";
-    }
-    current += (current ? "\n\n" : "") + message;
-  }
-  if (current) chunks.push(current);
-  for (const text of chunks) {
-    const response = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: process.env.TELEGRAM_CHAT_ID,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: false
-      }),
-      signal: AbortSignal.timeout(20000)
-    });
-    const data = await response.json();
-    if (!response.ok || !data.ok) throw new Error("Telegram delivery failed");
-  }
+  if (!response.ok || !data.ok) throw new Error(`Telegram delivery failed: ${data.description || response.status}`);
 }
 
 async function main() {
-  for (const key of ["TAVILY_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]) {
+  for (const key of ["WALMART_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]) {
     if (!process.env[key]) throw new Error(`Missing required secret: ${key}`);
   }
+
   const now = localHourAndDate();
   const hour = Number(now.hour);
   const isManualRun = ["workflow_dispatch", "push"].includes(process.env.GITHUB_EVENT_NAME);
@@ -288,34 +157,53 @@ async function main() {
     console.log(`Outside the 9 AM / 6 PM Eastern alert windows (${now.hour}:xx ET); safely skipping this UTC trigger.`);
     return;
   }
-  if (isManualRun) console.log("Manual or code-update test run requested; searching and sending any newly verified qualifying deals.");
+  if (isManualRun) console.log("Manual or code-update test run: querying SteadyAPI Walmart catalog.");
 
   let state = { seen: {} };
   try { state = JSON.parse(await fs.readFile(STATE_PATH, "utf8")); } catch {}
   state.seen ??= {};
 
-  const verified = new Map();
-  for (const store of STORES) {
-    console.log(`Searching ${store.name}...`);
-    const results = await tavilySearch(store.domain);
-    // Always retest the product the user confirmed is available in 3T; search indexing can omit it.
-    if (store.domain === "walmart.com") {
-      results.unshift({
-        title: "Garanimals Baby & Toddler Girl Dress 2-Piece Outfit Set",
-        url: "https://www.walmart.com/ip/20172702440"
-      });
-    }
-    const uniqueResults = [...new Map(results.map(r => [stableUrl(r.url), r])).values()];
-    for (const result of uniqueResults) {
-      const candidate = await verifyResult(result, store);
-      const previous = candidate ? state.seen[candidate.url] : null;
-      if (candidate && (!previous || Number(previous.price) > candidate.price)) verified.set(candidate.url, candidate);
+  console.log("Searching Walmart for toddler/kids clothing under $10...");
+  const listings = await searchProducts();
+  console.log(`SteadyAPI returned ${listings.length} listing(s) on page 1.`);
+
+  const byId = new Map();
+  // Always test the product the user confirmed is available in size 3T.
+  byId.set("20172702440", {
+    id: "20172702440",
+    title: "Garanimals Baby & Toddler Girl Dress 2-Piece Outfit Set",
+    url: "https://www.walmart.com/ip/Garanimals-Baby-Toddler-Girl-Dress-2-Piece-Outfit-Set-Sizes-0-6T/20172702440"
+  });
+
+  for (const item of listings) {
+    if (!item?.id || byId.size >= MAX_DETAILS_PER_RUN) continue;
+    if (!/(shirt|top|pant|short|dress|legging|outfit|clothing|pajama|toddler|kids)/i.test(item.title || "")) continue;
+    if (item.isPreowned === true) continue;
+    byId.set(String(item.id), item);
+  }
+
+  console.log(`Fetching detailed variant data for ${byId.size} product(s).`);
+  const verified = [];
+  for (const [id, listing] of byId) {
+    try {
+      const product = await getProductDetails(id);
+      const merged = { ...listing, ...product, id: String(product?.id || id) };
+      const deal = verifiedDeal(merged);
+      if (deal) {
+        const previous = state.seen[deal.url];
+        if (!previous || Number(previous.price) > deal.price) verified.push(deal);
+        console.log(`Verified ${deal.title}: $${deal.price.toFixed(2)} in size ${TARGET_SIZE}.`);
+      } else {
+        console.log(`Not eligible: ${listing.title || id} (no verified in-stock ${TARGET_SIZE} variant below $${MAX_PRICE}).`);
+      }
+    } catch (error) {
+      console.log(`Could not verify product ${id}: ${error.message}`);
     }
   }
 
-  const fresh = [...verified.values()].slice(0, MAX_ALERTS_PER_RUN);
+  const fresh = verified.slice(0, 10);
   if (!fresh.length) {
-    console.log(`No newly verified Walmart deals under ${MAX_PRICE} with an in-stock ${TARGET_SIZE} variant. Staying quiet.`);
+    console.log(`No newly verified Walmart deals below $${MAX_PRICE} with an in-stock ${TARGET_SIZE} variant. Staying quiet.`);
     return;
   }
 
@@ -326,10 +214,10 @@ async function main() {
   if (entries.length > 3000) state.seen = Object.fromEntries(entries.slice(-3000));
   await fs.mkdir("data", { recursive: true });
   await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
-  console.log(`Sent ${fresh.length} new Walmart ${TARGET_SIZE} deal(s) under ${MAX_PRICE}.`);
+  console.log(`Telegram accepted ${fresh.length} new Walmart ${TARGET_SIZE} deal(s) under $${MAX_PRICE}.`);
 }
 
-main().catch(err => {
-  console.error(err);
+main().catch(error => {
+  console.error(error);
   process.exitCode = 1;
 });
