@@ -99,7 +99,7 @@ function escapeHtml(s) {
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 async function tavilySearch(domain) {
-  const query = `kids toddler clothing 3T 4T under $100 shirts tops pants shorts dresses pajamas clearance ${domain}`;
+  const query = `kids toddler clothing 3T 4T under $100 in stock add to cart size variants shirts tops pants shorts dresses pajamas clearance ${domain}`;
   const response = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -107,7 +107,7 @@ async function tavilySearch(domain) {
       api_key: process.env.TAVILY_API_KEY,
       query,
       search_depth: "basic",
-      max_results: 6,
+      max_results: 15,
       include_domains: [domain],
       topic: "general"
     }),
