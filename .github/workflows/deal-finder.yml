@@ -1,6 +1,10 @@
 name: Kids clothing deal finder
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/deal-finder.mjs'
   schedule:
     # Eastern 9 AM and 6 PM: run at both possible UTC hours, then the script
     # gates execution to the correct America/New_York local hour (DST-safe).
