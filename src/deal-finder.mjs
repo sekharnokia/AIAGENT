@@ -64,6 +64,110 @@ function priceOf(offer) {
 function isInStock(offer) {
   return /InStock|LimitedAvailability/i.test(String(offer?.availability ?? ""));
 }
+function embeddedJsonDocuments(html) {
+  const docs = [];
+  const re = /<script\\b([^>]*)>([\\s\\S]*?)<\\/script>/gi;
+  for (const match of html.matchAll(re)) {
+    const attrs = match[1] || "";
+    const body = match[2]?.trim();
+    if (!body || !/(?:id=["']__NEXT_DATA__["']|__NEXT_DATA__|__APOLLO_STATE__)/i.test(attrs + body.slice(0, 300))) continue;
+    const candidates = [body];
+    const assignment = body.match(/(?:window\\.)?__(?:NEXT_DATA|APOLLO_STATE)__\\s*=\\s*({[\\s\\S]*})\\s*;?$/);
+    if (assignment?.[1]) candidates.push(assignment[1]);
+    for (const candidate of candidates) {
+      try { docs.push(JSON.parse(candidate)); break; } catch {}
+    }
+  }
+  return docs;
+}
+function deepEntries(node, wanted, depth = 0, out = []) {
+  if (!node || typeof node !== "object" || depth > 12) return out;
+  if (Array.isArray(node)) {
+    for (const item of node) deepEntries(item, wanted, depth + 1, out);
+    return out;
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (wanted.has(key.toLowerCase()) && value !== null && value !== undefined) out.push(value);
+    if (value && typeof value === "object") deepEntries(value, wanted, depth + 1, out);
+  }
+  return out;
+}
+function embeddedSize(node) {
+  const values = deepEntries(node, new Set(["size", "sizename", "sizevalue", "variantsize", "displaysize", "variantname", "optionvalue"]));
+  for (const value of values) {
+    const text = typeof value === "string" ? value : value?.name ?? value?.value ?? value?.label ?? "";
+    if (/(^|[^A-Z0-9])(3T|4T|3 TODDLER|4 TODDLER|3 YEARS?|4 YEARS?)([^A-Z0-9]|$)/i.test(String(text))) return String(text);
+  }
+  return null;
+}
+function embeddedPrice(node) {
+  const values = deepEntries(node, new Set(["price", "saleprice", "currentprice", "currentpricevalue"]));
+  for (const value of values) {
+    const raw = typeof value === "object" ? value?.price ?? value?.value ?? value?.amount : value;
+    const n = Number(String(raw ?? "").replace(/[^0-9.]/g, ""));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+function embeddedAvailability(node) {
+  const values = deepEntries(node, new Set(["availability", "availabilitystatus", "stockstatus", "isavailable", "instock"]));
+  return values.length ? values[0] : null;
+}
+function embeddedInStock(value) {
+  if (value === true) return true;
+  if (value === false || value == null) return false;
+  if (typeof value === "object") {
+    const nested = value.status ?? value.value ?? value.name ?? value.availabilityStatus;
+    return embeddedInStock(nested);
+  }
+  return /(?:InStock|LimitedAvailability|IN_STOCK|AVAILABLE|IN STOCK)/i.test(String(value))
+    && !/(?:OUT_OF_STOCK|NOT_AVAILABLE|UNAVAILABLE|SOLD_OUT)/i.test(String(value));
+}
+function walkEmbeddedVariants(node, ancestors = [], out = []) {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const item of node) walkEmbeddedVariants(item, ancestors, out);
+    return out;
+  }
+  const size = embeddedSize(node);
+  if (size) {
+    const contexts = [node, ...ancestors];
+    let price = null;
+    let stock = null;
+    for (const context of contexts) {
+      price ??= embeddedPrice(context);
+      if (stock === null) stock = embeddedAvailability(context);
+    }
+    if (price !== null && embeddedInStock(stock)) {
+      const titleValues = deepEntries(node, new Set(["productname", "itemname", "title", "name"]));
+      const title = titleValues.find(v => typeof v === "string" && v.length > 5);
+      out.push({ size, price, title: title || null });
+    }
+  }
+  const nextAncestors = [node, ...ancestors].slice(0, 8);
+  for (const value of Object.values(node)) {
+    if (value && typeof value === "object") walkEmbeddedVariants(value, nextAncestors, out);
+  }
+  return out;
+}
+function verifyWalmartEmbedded(html, fallbackTitle, url) {
+  for (const doc of embeddedJsonDocuments(html)) {
+    const variants = walkEmbeddedVariants(doc);
+    for (const variant of variants) {
+      if (variant.price >= MAX_PRICE) continue;
+      const retailer = STORES.find(s => new URL(url).hostname.toLowerCase().endsWith(s.domain));
+      if (!retailer) continue;
+      return {
+        title: decodeHtml(variant.title || fallbackTitle || "Kids clothing item").slice(0, 150),
+        price: variant.price,
+        size: variant.size,
+        retailer: retailer.name,
+        url
+      };
+    }
+  }
+  return null;
+}
 function verifyPage(html, fallbackTitle, url) {
   const products = parseJsonLd(html);
   for (const p of products) {
@@ -80,6 +184,9 @@ function verifyPage(html, fallbackTitle, url) {
         return { title, price, size: sizeText(v) || sizeText(offer), retailer: retailer.name, url };
       }
     }
+  }
+  if (new URL(url).hostname.toLowerCase().endsWith("walmart.com")) {
+    return verifyWalmartEmbedded(html, fallbackTitle, url);
   }
   return null;
 }
