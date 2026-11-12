@@ -86,25 +86,30 @@ function inStock(value) {
     && !/OUT_OF_STOCK|UNAVAILABLE|SOLD_OUT/i.test(String(value));
 }
 
+function getSizeFromSpecifications(product) {
+  const values = (Array.isArray(product?.specifications) ? product.specifications : [])
+    .filter(x => /^(clothing\s*)?size$/i.test(String(x?.name ?? "").trim()))
+    .map(x => String(x?.value ?? "").trim());
+  return values.find(value => /(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(value)) || null;
+}
+
 function verifiedDeal(product) {
-  const variants = Array.isArray(product.variants) ? product.variants : [];
-  for (const variant of variants) {
-    const size = getSizeFromVariant(variant);
-    const price = Number(variant.price ?? variant.currentPrice ?? product.price);
-    const availability = variant.availability ?? variant.availabilityStatus;
-    if (!size || !Number.isFinite(price) || price <= 0 || price >= MAX_PRICE || !inStock(availability)) continue;
-    const url = stableUrl(product.url, product.id);
-    if (!url) continue;
-    return {
-      title: product.title || "Walmart kids clothing",
-      retailer: "Walmart",
-      price,
-      size: TARGET_SIZE,
-      url,
-      id: String(product.id)
-    };
-  }
-  return null;
+  // This function is called only with an individual Walmart variant item,
+  // not the parent listing. Its own specification must identify size 3T.
+  const size = getSizeFromSpecifications(product);
+  const price = Number(product?.price);
+  const availability = product?.availability;
+  if (!size || !Number.isFinite(price) || price <= 0 || price >= MAX_PRICE || !inStock(availability)) return null;
+  const url = stableUrl(product.url, product.id);
+  if (!url) return null;
+  return {
+    title: product.title || "Walmart kids clothing",
+    retailer: "Walmart",
+    price,
+    size: TARGET_SIZE,
+    url,
+    id: String(product.id)
+  };
 }
 
 async function searchProducts() {
@@ -206,34 +211,69 @@ async function main() {
     byId.set(String(item.id), item);
   }
 
-  console.log(`Fetching detailed variant data for ${byId.size} product(s).`);
-  const verified = [];
+  console.log(`Fetching parent variant data for ${byId.size} product(s).`);
   const ids = [...byId.keys()];
-  let detailRows = [];
+  let parentRows = [];
   try {
-    detailRows = await getProductDetails(ids);
-    console.log(`SteadyAPI batch detail response contained ${detailRows.length} product record(s).`);
+    parentRows = await getProductDetails(ids);
+    console.log(`SteadyAPI parent detail response contained ${parentRows.length} product record(s).`);
   } catch (error) {
-    console.log(`Batch details request failed: ${error.message}`);
+    console.log(`Parent batch details request failed: ${error.message}`);
   }
 
-  const detailById = new Map(detailRows.map(product => [String(product?.id ?? ""), product]));
-  for (const [id, listing] of byId) {
-    const product = detailById.get(id);
-    if (!product || product.error) {
-      console.log(`Could not verify product ${id}: ${product?.error || "missing from batch response"}`);
+  // The parent response lists child Walmart item IDs, but its option labels
+  // can be blank. Resolve those individual item pages in a second batch:
+  // their own specifications and availability identify the actual size.
+  const childCandidates = [];
+  const parentById = new Map(parentRows.map(product => [String(product?.id ?? ""), product]));
+  for (const [parentId, listing] of byId) {
+    const parent = parentById.get(parentId);
+    if (!parent || parent.error) {
+      console.log(`Could not inspect parent ${parentId}: ${parent?.error || "missing from batch response"}`);
       continue;
     }
-    const merged = { ...listing, ...product, id: String(product?.id || id) };
-    const deal = verifiedDeal(merged);
+    const items = parent?.variants?.items;
+    if (!Array.isArray(items)) {
+      console.log(`No individual variant item list for ${listing.title || parentId}.`);
+      continue;
+    }
+    for (const item of items) {
+      const childId = String(item?.id ?? "");
+      if (!/^\\d{5,15}$/.test(childId)) continue;
+      if (Number(item?.price) >= MAX_PRICE || !inStock(item?.availability)) continue;
+      childCandidates.push({ id: childId, parentId, title: parent.title || listing.title, item });
+    }
+  }
+
+  const uniqueChildren = [...new Map(childCandidates.map(x => [x.id, x])).values()].slice(0, 5);
+  console.log(`Checking ${uniqueChildren.length} individual Walmart variant item(s) for exact size specifications.`);
+  let childRows = [];
+  if (uniqueChildren.length) {
+    try {
+      childRows = await getProductDetails(uniqueChildren.map(x => x.id));
+      console.log(`SteadyAPI child detail response contained ${childRows.length} product record(s).`);
+    } catch (error) {
+      console.log(`Child variant batch request failed: ${error.message}`);
+    }
+  }
+
+  const childById = new Map(childRows.map(product => [String(product?.id ?? ""), product]));
+  const verified = [];
+  for (const candidate of uniqueChildren) {
+    const product = childById.get(candidate.id);
+    if (!product || product.error) {
+      console.log(`Could not verify individual variant ${candidate.id}: ${product?.error || "missing from batch response"}`);
+      continue;
+    }
+    const deal = verifiedDeal(product);
     if (deal) {
       const previous = state.seen[deal.url];
       if (!previous || Number(previous.price) > deal.price) verified.push(deal);
-      console.log(`Verified ${deal.title}: ${deal.price.toFixed(2)} in size ${TARGET_SIZE}.`);
+      console.log(`Verified individual item ${deal.id}: ${deal.title}, $${deal.price.toFixed(2)}, size ${TARGET_SIZE}, in stock.`);
     } else {
-      // Diagnostic only: never logs credentials or the full product payload.
-      console.log(`Variant diagnostics for ${listing.title || id}: ${JSON.stringify(summarizeVariantData(merged))}`);
-      console.log(`Not eligible: no verified in-stock ${TARGET_SIZE} variant below ${MAX_PRICE}.`);
+      const sizeSpecs = (Array.isArray(product.specifications) ? product.specifications : [])
+        .filter(x => /size/i.test(String(x?.name ?? ""))).slice(0, 5);
+      console.log(`Individual item ${candidate.id} not eligible: price=${product.price ?? "unknown"}, availability=${product.availability ?? "unknown"}, sizeSpecifications=${JSON.stringify(sizeSpecs)}.`);
     }
   }
 
