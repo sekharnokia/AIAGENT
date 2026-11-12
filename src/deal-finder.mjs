@@ -202,7 +202,7 @@ async function main() {
 
   const fresh = [...verified.values()].slice(0, MAX_ALERTS_PER_RUN);
   if (!fresh.length) {
-    console.log("No newly verified deals under $6 with an in-stock 3T/4T variant. Staying quiet.");
+    console.log(`No newly verified deals under ${MAX_PRICE} with an in-stock 3T/4T variant. Staying quiet.`);
     return;
   }
 
