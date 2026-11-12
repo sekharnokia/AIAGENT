@@ -2,12 +2,9 @@ import fs from "node:fs/promises";
 
 const STORES = [
   { name: "Walmart", domain: "walmart.com" },
-  { name: "Target", domain: "target.com" },
-  { name: "Carter's", domain: "carters.com" },
-  { name: "Old Navy", domain: "oldnavy.gap.com" },
-  { name: "The Children's Place", domain: "childrensplace.com" },
 ];
-const MAX_PRICE = 100;
+const TARGET_SIZE = "3T";
+const MAX_PRICE = 10;
 const STATE_PATH = "data/seen.json";
 const MAX_ALERTS_PER_RUN = 12;
 const TIME_ZONE = "America/New_York";
@@ -54,7 +51,7 @@ function sizeText(v) {
     .filter(Boolean).join(" ").toUpperCase();
 }
 function isTargetSize(v) {
-  return /(^|[^A-Z0-9])(3T|4T|3 TODDLER|4 TODDLER|3 YEARS?|4 YEARS?)([^A-Z0-9]|$)/i.test(sizeText(v));
+  return /(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(sizeText(v));
 }
 function priceOf(offer) {
   const raw = offer?.price ?? offer?.lowPrice ?? offer?.priceSpecification?.price;
@@ -96,7 +93,7 @@ function embeddedSize(node) {
   const values = deepEntries(node, new Set(["size", "sizename", "sizevalue", "variantsize", "displaysize", "variantname", "optionvalue"]));
   for (const value of values) {
     const text = typeof value === "string" ? value : value?.name ?? value?.value ?? value?.label ?? "";
-    if (/(^|[^A-Z0-9])(3T|4T|3 TODDLER|4 TODDLER|3 YEARS?|4 YEARS?)([^A-Z0-9]|$)/i.test(String(text))) return String(text);
+    if (/(^|[^A-Z0-9])3T([^A-Z0-9]|$)/i.test(String(text))) return String(text);
   }
   return null;
 }
@@ -206,7 +203,7 @@ function escapeHtml(s) {
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 async function tavilySearch(domain) {
-  const query = `kids toddler clothing 3T 4T under $100 in stock add to cart size variants shirts tops pants shorts dresses pajamas clearance ${domain}`;
+  const query = `Walmart kids toddler clothing size 3T price under $10 clearance sale in stock available add to cart shirts tops pants shorts dresses pajamas` ;
   const response = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -301,15 +298,24 @@ async function main() {
   for (const store of STORES) {
     console.log(`Searching ${store.name}...`);
     const results = await tavilySearch(store.domain);
-    for (const result of results) {
+    // Always retest the product the user confirmed is available in 3T; search indexing can omit it.
+    if (store.domain === "walmart.com") {
+      results.unshift({
+        title: "Garanimals Baby & Toddler Girl Dress 2-Piece Outfit Set",
+        url: "https://www.walmart.com/ip/20172702440"
+      });
+    }
+    const uniqueResults = [...new Map(results.map(r => [stableUrl(r.url), r])).values()];
+    for (const result of uniqueResults) {
       const candidate = await verifyResult(result, store);
-      if (candidate && !state.seen[candidate.url]) verified.set(candidate.url, candidate);
+      const previous = candidate ? state.seen[candidate.url] : null;
+      if (candidate && (!previous || Number(previous.price) > candidate.price)) verified.set(candidate.url, candidate);
     }
   }
 
   const fresh = [...verified.values()].slice(0, MAX_ALERTS_PER_RUN);
   if (!fresh.length) {
-    console.log(`No newly verified deals under ${MAX_PRICE} with an in-stock 3T/4T variant. Staying quiet.`);
+    console.log(`No newly verified Walmart deals under ${MAX_PRICE} with an in-stock ${TARGET_SIZE} variant. Staying quiet.`);
     return;
   }
 
@@ -320,7 +326,7 @@ async function main() {
   if (entries.length > 3000) state.seen = Object.fromEntries(entries.slice(-3000));
   await fs.mkdir("data", { recursive: true });
   await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
-  console.log(`Sent ${fresh.length} new verified deal(s).`);
+  console.log(`Sent ${fresh.length} new Walmart ${TARGET_SIZE} deal(s) under ${MAX_PRICE}.`);
 }
 
 main().catch(err => {
