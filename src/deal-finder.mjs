@@ -7,7 +7,7 @@ const STORES = [
   { name: "Old Navy", domain: "oldnavy.gap.com" },
   { name: "The Children's Place", domain: "childrensplace.com" },
 ];
-const MAX_PRICE = 10;
+const MAX_PRICE = 100;
 const STATE_PATH = "data/seen.json";
 const MAX_ALERTS_PER_RUN = 12;
 const TIME_ZONE = "America/New_York";
@@ -99,7 +99,7 @@ function escapeHtml(s) {
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 async function tavilySearch(domain) {
-  const query = `kids toddler clothing 3T 4T under $6 shirts tops pants shorts dresses pajamas clearance ${domain}`;
+  const query = `kids toddler clothing 3T 4T under $100 shirts tops pants shorts dresses pajamas clearance ${domain}`;
   const response = await fetch("https://api.tavily.com/search", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -179,12 +179,12 @@ async function main() {
   }
   const now = localHourAndDate();
   const hour = Number(now.hour);
-  const isManualRun = process.env.GITHUB_EVENT_NAME === "workflow_dispatch";
+  const isManualRun = ["workflow_dispatch", "push"].includes(process.env.GITHUB_EVENT_NAME);
   if (!isManualRun && ![9, 18].includes(hour)) {
     console.log(`Outside the 9 AM / 6 PM Eastern alert windows (${now.hour}:xx ET); safely skipping this UTC trigger.`);
     return;
   }
-  if (isManualRun) console.log("Manual test run requested; searching and sending any newly verified qualifying deals.");
+  if (isManualRun) console.log("Manual or code-update test run requested; searching and sending any newly verified qualifying deals.");
 
   let state = { seen: {} };
   try { state = JSON.parse(await fs.readFile(STATE_PATH, "utf8")); } catch {}
