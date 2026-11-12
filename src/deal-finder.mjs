@@ -7,7 +7,7 @@ const STORES = [
   { name: "Old Navy", domain: "oldnavy.gap.com" },
   { name: "The Children's Place", domain: "childrensplace.com" },
 ];
-const MAX_PRICE = 6;
+const MAX_PRICE = 10;
 const STATE_PATH = "data/seen.json";
 const MAX_ALERTS_PER_RUN = 12;
 const TIME_ZONE = "America/New_York";
