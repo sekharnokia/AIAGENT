@@ -4,7 +4,7 @@ const API_BASE = "https://api.steadyapi.com/v1/walmart";
 const TARGET_SIZE = "3T";
 const MAX_PRICE = 10;
 const STATE_PATH = "data/seen.json";
-const MAX_DETAILS_PER_RUN = 4; // 1 seeded item + at most 3 search results
+const MAX_DETAILS_PER_RUN = 3; // 1 seeded item + at most 2 search results; stay within the free monthly request budget
 const TIME_ZONE = "America/New_York";
 
 function localHourAndDate() {
