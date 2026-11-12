@@ -67,11 +67,7 @@ function isInStock(offer) {
 function verifyPage(html, fallbackTitle, url) {
   const products = parseJsonLd(html);
   for (const p of products) {
-    const variants = [
-      ...asArray(p.hasVariant),
-      ...asArray(p.model),
-      p
-    ];
+    const variants = [...asArray(p.hasVariant), ...asArray(p.model), p];
     for (const v of variants) {
       const offers = offerList(v.offers ?? v.offers?.offers);
       for (const offer of offers) {
@@ -183,10 +179,12 @@ async function main() {
   }
   const now = localHourAndDate();
   const hour = Number(now.hour);
-  if (![9, 18].includes(hour)) {
+  const isManualRun = process.env.GITHUB_EVENT_NAME === "workflow_dispatch";
+  if (!isManualRun && ![9, 18].includes(hour)) {
     console.log(`Outside the 9 AM / 6 PM Eastern alert windows (${now.hour}:xx ET); safely skipping this UTC trigger.`);
     return;
   }
+  if (isManualRun) console.log("Manual test run requested; searching and sending any newly verified qualifying deals.");
 
   let state = { seen: {} };
   try { state = JSON.parse(await fs.readFile(STATE_PATH, "utf8")); } catch {}
@@ -212,9 +210,7 @@ async function main() {
   const timestamp = new Date().toISOString();
   for (const item of fresh) state.seen[item.url] = { firstSeen: timestamp, price: item.price };
   const entries = Object.entries(state.seen);
-  if (entries.length > 3000) {
-    state.seen = Object.fromEntries(entries.slice(-3000));
-  }
+  if (entries.length > 3000) state.seen = Object.fromEntries(entries.slice(-3000));
   await fs.mkdir("data", { recursive: true });
   await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
   console.log(`Sent ${fresh.length} new verified deal(s).`);
